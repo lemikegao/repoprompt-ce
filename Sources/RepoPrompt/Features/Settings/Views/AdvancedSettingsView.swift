@@ -1,3 +1,6 @@
+import RepoPromptFileSystem
+import RepoPromptSettingsCore
+
 //
 //  AdvancedSettingsView.swift
 //  RepoPrompt
@@ -24,6 +27,13 @@ struct AdvancedSettingsView: View {
     @ObservedObject var promptViewModel: PromptViewModel
     @ObservedObject private var globalSettings = GlobalSettingsStore.shared
     let windowState: WindowState
+
+    private var historyIdleThresholdDoubleBinding: Binding<Double> {
+        Binding(
+            get: { Double(globalSettings.historyIdleThresholdMinutes()) },
+            set: { globalSettings.setHistoryIdleThresholdMinutes(Int($0)) }
+        )
+    }
 
     private var enableKeyboardShortcutsBinding: Binding<Bool> {
         Binding(
@@ -104,6 +114,11 @@ struct AdvancedSettingsView: View {
                     .padding(.horizontal, -16)
 
                 aiBehaviorSection
+
+                Divider()
+                    .padding(.horizontal, -16)
+
+                historySection
 
                 Divider()
                     .padding(.horizontal, -16)
@@ -211,6 +226,15 @@ struct AdvancedSettingsView: View {
                     )
                 )
 
+                SettingToggle(
+                    title: "Enable Code Maps in non-Git folders",
+                    description: "Off by default for existing workspaces. Enable to allow background Code Map scanning for plain folders.",
+                    isOn: Binding(
+                        get: { globalSettings.nonGitCodeMapsEnabled },
+                        set: { globalSettings.setNonGitCodeMapsEnabled($0) }
+                    )
+                )
+
                 if globalSettings.codeMapsGloballyDisabled {
                     Text("Code Maps are disabled globally. Existing Copy and Chat Code Map modes are preserved and will take effect again when this is turned off.")
                         .font(.subheadline)
@@ -242,6 +266,40 @@ struct AdvancedSettingsView: View {
     }
 
     // MARK: - Keyboard Shortcuts
+
+    private var historySection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("History")
+                .font(.title3)
+                .fontWeight(.semibold)
+
+            SettingSection(
+                title: "Time Tracking",
+                description: "Controls how the history MCP tool measures active work time."
+            ) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Default idle threshold")
+                    Text("Gaps between agent turns longer than this are counted as idle (not active work) when querying time spent. Lower values are stricter — only focused work counts. Higher values include short breaks. Can be overridden per-query via the idle_threshold_minutes parameter.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack {
+                        Text("0")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .frame(width: 25)
+                        Slider(value: historyIdleThresholdDoubleBinding, in: 0 ... 60, step: 1)
+                            .accentColor(.blue)
+                        Text("\(Int(historyIdleThresholdDoubleBinding.wrappedValue)) min")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .frame(width: 45, alignment: .trailing)
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, 4)
+    }
 
     private var keyboardShortcutsSection: some View {
         SettingSection(

@@ -3,8 +3,13 @@ import RepoPromptShared
 import SwiftUI
 
 func normalizedToolCardName(_ name: String?) -> String? {
-    guard let raw = name?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return nil }
-    let canonical = MCPIntegrationHelper.canonicalRepoPromptToolName(raw) ?? raw
+    guard let acceptedName = AgentToolNamePolicy.accepted(name) else { return nil }
+    let raw = acceptedName.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !raw.isEmpty else { return nil }
+    // Companion calls keep their server prefix in the transcript; cards show the bare action.
+    let canonical = MCPIntegrationHelper.computerUseCompanionToolName(raw)
+        ?? MCPIntegrationHelper.canonicalRepoPromptToolName(raw)
+        ?? raw
     // External tools can be namespaced (for example, "functions.bash").
     // Route by suffix so tool cards stay consistent.
     if let webCanonical = AgentWebToolCanonicalNames.canonicalToolCardName(canonical.lowercased()) {
@@ -41,11 +46,23 @@ enum AgentOracleToolRouting {
     static func operationPopoverUserInfo(
         openContext: AgentOracleOpenContext?,
         chatID: String?,
-        tabID: UUID? = nil
+        tabID: UUID? = nil,
+        presentation: AgentOraclePopoverPresentation = .standard
     ) -> [AnyHashable: Any]? {
         AgentOraclePopoverRoute(
             openContext: openContext,
             chatID: chatID,
+            tabID: tabID,
+            presentation: presentation
+        )?.notificationUserInfo
+    }
+
+    static func latestPopoverUserInfo(
+        openContext: AgentOracleOpenContext?,
+        tabID: UUID? = nil
+    ) -> [AnyHashable: Any]? {
+        AgentOracleLatestPopoverRoute(
+            openContext: openContext,
             tabID: tabID
         )?.notificationUserInfo
     }
@@ -314,12 +331,16 @@ private enum ToolCardSubtitleBuilder {
             }
         case "get_code_structure":
             if let args = ToolJSON.decodeArgs(ToolArgsDTOs.CodeStructureArgs.self, from: argsJSON) {
-                if args.scope == "selected" {
-                    return "selected"
+                let target = if let count = args.paths?.count, count > 0 {
+                    "\(count) path\(count == 1 ? "" : "s")"
+                } else {
+                    "selection"
                 }
-                if let count = args.paths?.count, count > 0 {
-                    return "\(count) path\(count == 1 ? "" : "s")"
+                if let expand = args.expand {
+                    let depth = args.depth ?? 1
+                    return "\(target) • \(expand), depth \(depth)"
                 }
+                return target
             }
         case "file_actions":
             if let args = ToolJSON.decodeArgs(ToolArgsDTOs.FileActionsArgs.self, from: argsJSON),
@@ -617,8 +638,10 @@ private enum ToolCardSubtitleBuilder {
         if detach == true {
             return "detach"
         }
-        let resolvedTimeout = timeout ?? MCPTimeoutPolicy.agentLifecycleDefaultWaitSeconds
-        return resolvedTimeout <= 0 ? "poll" : "wait ≤\(formatSeconds(resolvedTimeout))"
+        guard let timeout else {
+            return "wait (default)"
+        }
+        return timeout <= 0 ? "poll" : "wait ≤\(formatSeconds(timeout))"
     }
 
     private static func formatSeconds(_ seconds: Double) -> String {
@@ -733,11 +756,25 @@ func oracleToolCallPopoverUserInfo(
     guard let toolName = normalizedToolCardName(item.toolName)?.lowercased(),
           toolName == "chat_send" || toolName == "ask_oracle" || toolName == "oracle_send"
     else { return nil }
-    let chatID = AgentOracleAuthoritativeChatIDPolicy.extract(fromSerializedJSON: item.toolArgsJSON)
-    return AgentOracleToolRouting.operationPopoverUserInfo(
+
+    if let exact = AgentOracleToolRouting.operationPopoverUserInfo(
         openContext: openContext,
-        chatID: chatID
-    )
+        chatID: AgentOracleAuthoritativeChatIDPolicy.extract(fromSerializedJSON: item.toolResultJSON)
+    ) {
+        return exact
+    }
+    guard item.toolResultJSON == nil, item.toolIsError == nil else { return nil }
+
+    if let exact = AgentOracleToolRouting.operationPopoverUserInfo(
+        openContext: openContext,
+        chatID: AgentOracleAuthoritativeChatIDPolicy.extract(fromSerializedJSON: item.toolArgsJSON)
+    ) {
+        return exact
+    }
+    guard AgentOracleAuthoritativeChatIDPolicy.allowsLatestFallback(fromSerializedJSON: item.toolArgsJSON) else {
+        return nil
+    }
+    return AgentOracleToolRouting.latestPopoverUserInfo(openContext: openContext)
 }
 
 enum ToolCallCardStateResolver {

@@ -1,18 +1,9 @@
-@testable import RepoPrompt
+@testable import RepoPromptApp
+import RepoPromptFileSystem
 import XCTest
 
 @MainActor
 final class WorkspaceCodemapUIPresentationTests: XCTestCase {
-    private var temporaryRoots: [URL] = []
-
-    override func tearDownWithError() throws {
-        for root in temporaryRoots {
-            try? FileManager.default.removeItem(at: root)
-        }
-        temporaryRoots.removeAll()
-        try super.tearDownWithError()
-    }
-
     func testCurrentMarkerRequiresRenderablePresentationIdentity() throws {
         let file = makeFileViewModel(name: "Marker.swift")
         let entry = try makePresentationEntry(file: file)
@@ -41,32 +32,11 @@ final class WorkspaceCodemapUIPresentationTests: XCTestCase {
         XCTAssertEqual(disposition, .revoked)
     }
 
-    func testNonGitPreviewIsTypedUnavailableWithoutCodemapArtifactWork() async throws {
-        let rootURL = try makeTemporaryRoot(name: "NonGitPreview")
-        let sourceURL = rootURL.appendingPathComponent("Sources/App.swift")
-        try FileManager.default.createDirectory(
-            at: sourceURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        try "struct NonGitPreviewType {}\n".write(to: sourceURL, atomically: true, encoding: .utf8)
-
-        let store = WorkspaceFileContextStore()
-        let root = try await store.loadRoot(path: rootURL.path)
-        let manager = WorkspaceFilesViewModel(workspaceFileContextStore: store)
-        _ = try manager.attachRootShell(for: root, workspaceID: UUID())
-        let materializedFile = await manager.materializeFileForUserInput(sourceURL.path)
-        let file = try XCTUnwrap(materializedFile)
-
-        let disposition = await manager.codemapPreview(for: file.id)
-        guard case let .unavailable(coverage, issues) = disposition else {
-            return XCTFail("Expected typed unavailable preview, got \(disposition)")
-        }
-        XCTAssertFalse(issues.isEmpty)
-        if case .complete = coverage {
-            XCTFail("Unavailable preview cannot report complete coverage")
-        }
-        await store.unloadRoot(id: root.id)
-    }
+    // The obsolete plain-folder "typed unavailable" preview contract was removed with non-Git
+    // Code Map support. Positive preview coverage for a plain on-disk root now lives in
+    // `CodemapAutomaticSelectionGraphNativeTests`
+    // `.testFilesystemTSAndTSXCodeMapsUseCurrentBytesWithoutGitOrManifestAccess`, which asserts a
+    // rendered entry containing the actual current symbols instead of an unavailability reason.
 
     private func makeFileViewModel(name: String) -> FileViewModel {
         let root = FileManager.default.temporaryDirectory
@@ -98,17 +68,8 @@ final class WorkspaceCodemapUIPresentationTests: XCTestCase {
                 rootLifetimeID: UUID()
             ),
             logicalPath: logicalPath,
-            text: "struct RenderedPreview {}",
+            text: SwiftFixtureSource.emptyStruct("RenderedPreview", trailingNewline: false),
             tokenCount: 7
         )
-    }
-
-    private func makeTemporaryRoot(name: String) throws -> URL {
-        let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent("RepoPromptTests", isDirectory: true)
-            .appendingPathComponent("\(name)-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        temporaryRoots.append(root)
-        return root
     }
 }

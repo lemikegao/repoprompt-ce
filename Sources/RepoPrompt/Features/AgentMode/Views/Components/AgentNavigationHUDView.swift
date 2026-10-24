@@ -5,9 +5,21 @@ struct AgentNavigationHUDView: View {
     let windowState: WindowState
     @FocusState private var queryFocused: Bool
     @State private var suppressHoverSelectionUntil = Date.distantPast
+    @State private var activityReferenceDate = Date()
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @ObservedObject private var fontScale = FontScaleManager.shared
+
+    /// AppKit can represent Shift-Tab as back-tab rather than Tab + Shift.
+    /// Lock-state modifiers must not steal focus from the HUD's navigation field.
+    static func roleFilterCyclesBackward(key: KeyEquivalent, modifiers: EventModifiers) -> Bool? {
+        let navigationModifiers = modifiers.subtracting(.capsLock)
+        let isBackTab = key == KeyEquivalent("\u{19}")
+        guard key == .tab || isBackTab,
+              navigationModifiers.isEmpty || navigationModifiers == .shift
+        else { return nil }
+        return isBackTab || navigationModifiers == .shift
+    }
 
     private var fontPreset: FontScalePreset {
         fontScale.preset
@@ -25,13 +37,6 @@ struct AgentNavigationHUDView: View {
                     .padding(.top, topInset(for: geometry.size))
                     .padding(.horizontal, 24)
                     .padding(.bottom, 24)
-            }
-        }
-        .task {
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-                guard !Task.isCancelled else { return }
-                viewModel.refresh(currentWindow: windowState)
             }
         }
         .accessibilityAddTraits(.isModal)
@@ -55,17 +60,26 @@ struct AgentNavigationHUDView: View {
         .background(
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .fill(panelBackgroundStyle)
+                .shadow(color: Color.black.opacity(0.24), radius: 24, y: 14)
         )
         .overlay(
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .strokeBorder(Color(NSColor.separatorColor).opacity(0.62), lineWidth: 1)
         )
-        .shadow(color: Color.black.opacity(0.24), radius: 24, y: 14)
-        .onAppear { queryFocused = true }
+        .onAppear {
+            queryFocused = true
+            activityReferenceDate = Date()
+        }
         .agentNavigationHUDKeys(
             viewModel: viewModel,
-            onKeyboardNavigation: suppressHoverSelectionAfterKeyboardNavigation
+            onKeyboardNavigation: suppressHoverSelectionAfterKeyboardNavigation,
+            onNumberSelection: { index in
+                Task { await viewModel.selectItem(atDisplayIndex: index, currentWindow: windowState) }
+            }
         )
+        .onExitCommand {
+            _ = viewModel.clearQueryOrDismiss()
+        }
         .accessibilityElement(children: .contain)
     }
 
@@ -121,7 +135,15 @@ struct AgentNavigationHUDView: View {
     }
 
     private var summaryText: String {
-        var parts: [String] = [pluralized(viewModel.totalItemCount, singular: "session", plural: "sessions")]
+        var parts: [String] = []
+        if viewModel.roleFilter != .all {
+            parts.append(
+                viewModel.roleFilter == .overseers
+                    ? pluralized(viewModel.roleItemCount, singular: "overseer", plural: "overseers")
+                    : "\(viewModel.roleItemCount) overseen"
+            )
+        }
+        parts.append(pluralized(viewModel.totalItemCount, singular: "session", plural: "sessions"))
         if viewModel.needsAttentionCount > 0 {
             parts.append("\(viewModel.needsAttentionCount) need attention")
         }
@@ -164,9 +186,22 @@ struct AgentNavigationHUDView: View {
             TextField("Search sessions", text: $viewModel.query)
                 .textFieldStyle(.plain)
                 .focused($queryFocused)
+                .onKeyPress(phases: .down) { press in
+                    guard viewModel.showsRoleFilter,
+                          let backward = Self.roleFilterCyclesBackward(key: press.key, modifiers: press.modifiers)
+                    else { return .ignored }
+                    viewModel.cycleRoleFilter(backward: backward)
+                    return .handled
+                }
                 .onSubmit {
                     Task { await viewModel.selectHighlighted(currentWindow: windowState) }
                 }
+                .onExitCommand {
+                    _ = viewModel.clearQueryOrDismiss()
+                }
+            if viewModel.showsRoleFilter {
+                roleFilterControl
+            }
             if viewModel.hiddenSubagentCount > 0 {
                 subagentToggle
             }
@@ -178,6 +213,34 @@ struct AgentNavigationHUDView: View {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .strokeBorder(Color(NSColor.separatorColor).opacity(0.45), lineWidth: 0.75)
         )
+    }
+
+    private var roleFilterControl: some View {
+        HStack(spacing: 1) {
+            ForEach(AgentNavigationHUDRoleFilter.allCases) { filter in
+                Button {
+                    viewModel.setRoleFilter(filter)
+                    queryFocused = true
+                } label: {
+                    HStack(spacing: 3) {
+                        if let symbol = filter.symbol { Image(systemName: symbol) }
+                        Text(filter.title)
+                    }
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .semibold))
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 4)
+                    .background(viewModel.roleFilter == filter ? Color.accentColor.opacity(0.16) : Color.clear, in: Capsule())
+                    .foregroundStyle(viewModel.roleFilter == filter ? Color.accentColor : Color.secondary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Filter: \(filter.title) sessions")
+                .accessibilityAddTraits(viewModel.roleFilter == filter ? [.isSelected] : [])
+                .hoverTooltip("\(filter.title) sessions (Tab / Shift-Tab to cycle)")
+            }
+        }
+        .fixedSize()
+        .background(Color(NSColor.controlBackgroundColor).opacity(reduceTransparency ? 1 : 0.72), in: Capsule())
+        .overlay(Capsule().strokeBorder(Color(NSColor.separatorColor).opacity(0.45), lineWidth: 0.75))
     }
 
     private var subagentToggle: some View {
@@ -202,7 +265,12 @@ struct AgentNavigationHUDView: View {
         }
         .buttonStyle(.plain)
         .accessibilityLabel(viewModel.showSubagents ? "Hide sub-agents" : "Show sub-agents")
-        .hoverTooltip(viewModel.showSubagents ? "Hide sub-agent sessions (⌃S)" : "Show sub-agent sessions (⌃S)")
+        .disabled(viewModel.roleFilter != .all)
+        .hoverTooltip(
+            viewModel.roleFilter != .all
+                ? "Role filters include sub-agents at every depth"
+                : (viewModel.showSubagents ? "Hide sub-agent sessions (⌃S)" : "Show sub-agent sessions (⌃S)")
+        )
     }
 
     private var errorSlot: some View {
@@ -227,13 +295,15 @@ struct AgentNavigationHUDView: View {
                     if items.isEmpty {
                         emptyState
                     } else {
-                        ForEach(items) { item in
+                        ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
                             AgentNavigationHUDRow(
                                 item: item,
                                 isSelected: item.id == viewModel.selectedItemID,
                                 fontPreset: fontPreset,
-                                now: Date(),
-                                showsSubagentRollup: !viewModel.showSubagents && viewModel.queryIsEmpty,
+                                now: activityReferenceDate,
+                                shortcutNumber: index < 9 ? index + 1 : nil,
+                                showsSubagentRollup: viewModel.roleFilter == .all && !viewModel.showSubagents && !viewModel.hasSearchTerms,
+                                flattensHierarchy: viewModel.roleFilter != .all,
                                 onHover: {
                                     guard Date() >= suppressHoverSelectionUntil else { return }
                                     viewModel.moveSelection(to: item.id)
@@ -264,20 +334,35 @@ struct AgentNavigationHUDView: View {
 
     private var emptyState: some View {
         VStack(spacing: 6) {
-            Text(viewModel.queryIsEmpty ? viewModel.snapshot.mode.emptyTitle : "No matches for “\(viewModel.query)”")
-                .font(fontPreset.swiftUIFont(sizeAtNormal: 13, weight: .medium))
-                .foregroundStyle(.primary)
+            Text(
+                viewModel.isLoadingSnapshot
+                    ? "Loading sessions…"
+                    : (viewModel.hasSearchTerms ? "No matches for “\(viewModel.query)”" : viewModel.emptyTitle)
+            )
+            .font(fontPreset.swiftUIFont(sizeAtNormal: 13, weight: .medium))
+            .foregroundStyle(.primary)
+            if viewModel.roleFilter != .all, !viewModel.isLoadingSnapshot {
+                Button("Show all") {
+                    viewModel.setRoleFilter(.all)
+                    queryFocused = true
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(Color.accentColor)
+                .accessibilityLabel("Show all session roles")
+            }
             Text(emptyHint)
                 .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
         }
         .frame(maxWidth: .infinity, minHeight: 96)
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .contain)
     }
 
     private var emptyHint: String {
-        if !viewModel.queryIsEmpty {
+        if viewModel.isLoadingSnapshot { return "Preparing the session list." }
+        if viewModel.roleFilter != .all { return "Show all to remove the role filter. Search narrows the selected role." }
+        if viewModel.hasSearchTerms {
             return viewModel.snapshot.mode == .currentWindow
                 ? "Press ⇧⌘K to search across all Agent sessions."
                 : "Try a session title, workspace, worktree, or status."
@@ -291,6 +376,8 @@ struct AgentNavigationHUDView: View {
         HStack(spacing: 8) {
             footerHint("↑↓", "Navigate")
             footerHint("↩", "Jump")
+            footerHint("⌘1–9", "Pick")
+            if viewModel.showsRoleFilter { footerHint("⇥", "Filter") }
             footerHint(viewModel.snapshot.mode == .currentWindow ? "⇧⌘K" : "⌘K", viewModel.snapshot.mode == .currentWindow ? "All Agents" : "This Window")
             Spacer()
             footerHint("esc", viewModel.queryIsEmpty ? "Close" : "Clear")
@@ -326,9 +413,16 @@ struct AgentNavigationHUDView: View {
 private extension View {
     func agentNavigationHUDKeys(
         viewModel: AgentNavigationHUDViewModel,
-        onKeyboardNavigation: @escaping () -> Void
+        onKeyboardNavigation: @escaping () -> Void,
+        onNumberSelection: @escaping (Int) -> Void
     ) -> some View {
         onKeyPress(phases: [.down, .repeat]) { press in
+            if press.modifiers == .command,
+               let index = hudSelectionIndex(for: press.key)
+            {
+                onNumberSelection(index)
+                return .handled
+            }
             if press.modifiers == .control {
                 if press.key == "n" {
                     onKeyboardNavigation()
@@ -362,6 +456,11 @@ private extension View {
             }
         }
     }
+
+    private func hudSelectionIndex(for key: KeyEquivalent) -> Int? {
+        guard let digit = key.character.wholeNumberValue, (1 ... 9).contains(digit) else { return nil }
+        return digit - 1
+    }
 }
 
 private struct AgentNavigationHUDRow: View {
@@ -369,14 +468,16 @@ private struct AgentNavigationHUDRow: View {
     let isSelected: Bool
     let fontPreset: FontScalePreset
     let now: Date
+    let shortcutNumber: Int?
     let showsSubagentRollup: Bool
+    let flattensHierarchy: Bool
     let onHover: () -> Void
     let action: () -> Void
 
     var body: some View {
         Button(action: action) {
             HStack(spacing: 10) {
-                if item.displayDepth > 0 {
+                if !flattensHierarchy, item.displayDepth > 0 {
                     subagentIndent
                 }
                 AgentNavigationHUDStatusPlate(item: item, selected: isSelected)
@@ -395,6 +496,21 @@ private struct AgentNavigationHUDRow: View {
                             .lineLimit(1)
                         if let status = item.statusLabel, status != "Idle" {
                             AgentNavigationHUDChip(text: status, tone: tone(for: item), selected: isSelected)
+                                .fixedSize()
+                                .layoutPriority(2)
+                        }
+                        if item.overseenSessionCount > 0 {
+                            AgentNavigationHUDChip(text: "Overseeing \(item.overseenSessionCount)", tone: .accent, selected: isSelected, symbol: "eye.fill")
+                                .fixedSize()
+                                .layoutPriority(1)
+                        }
+                        if item.isOverseen {
+                            Image(systemName: "eye")
+                                .font(.system(size: 10))
+                                .foregroundStyle(isSelected ? Color.white.opacity(0.8) : Color.secondary)
+                                .hoverTooltip("Overseen by another session")
+                                .accessibilityHidden(true)
+                                .fixedSize()
                         }
                         if showsSubagentRollup, let label = item.subagentChipLabel {
                             AgentNavigationHUDSubagentChip(
@@ -402,6 +518,8 @@ private struct AgentNavigationHUDRow: View {
                                 attention: item.hasHiddenSubagentAttention,
                                 selected: isSelected
                             )
+                            .fixedSize()
+                            .layoutPriority(1)
                         }
                     }
                     HStack(spacing: 6) {
@@ -457,6 +575,11 @@ private struct AgentNavigationHUDRow: View {
                 .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .semibold))
                 .foregroundStyle(Color.white.opacity(0.78))
                 .frame(width: 42, alignment: .trailing)
+        } else if let shortcutNumber {
+            Text("⌘\(shortcutNumber)")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 10, weight: .semibold))
+                .foregroundStyle(Color.secondary.opacity(0.82))
+                .frame(width: 34, alignment: .trailing)
         } else if !item.isActiveTab {
             Text(relativeActivityLabel)
                 .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
@@ -631,8 +754,6 @@ private struct AgentNavigationHUDWorktreeMarker: View {
 
 private struct AgentNavigationHUDActivityArc: View {
     var tint: Color = .accentColor
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var rotation: Double = 0
 
     var body: some View {
         Circle()
@@ -642,13 +763,7 @@ private struct AgentNavigationHUDActivityArc: View {
                 style: StrokeStyle(lineWidth: 1.5, lineCap: .round)
             )
             .frame(width: 15, height: 15)
-            .rotationEffect(.degrees(rotation))
-            .onAppear {
-                guard !reduceMotion else { return }
-                withAnimation(.linear(duration: 1.0).repeatForever(autoreverses: false)) {
-                    rotation = 360
-                }
-            }
+            .rotationEffect(.degrees(35))
             .accessibilityLabel("Running")
     }
 }
@@ -699,14 +814,18 @@ private struct AgentNavigationHUDChip: View {
     let text: String
     let tone: Tone
     let selected: Bool
+    var symbol: String?
 
     var body: some View {
-        Text(text)
-            .font(.caption2.weight(.semibold))
-            .padding(.horizontal, 5)
-            .padding(.vertical, 2)
-            .background(selected ? Color.white.opacity(0.18) : color.opacity(0.12), in: Capsule())
-            .foregroundStyle(selected ? Color.white : color)
+        HStack(spacing: 3) {
+            if let symbol { Image(systemName: symbol) }
+            Text(text)
+        }
+        .font(.caption2.weight(.semibold))
+        .padding(.horizontal, 5)
+        .padding(.vertical, 2)
+        .background(selected ? Color.white.opacity(0.18) : color.opacity(0.12), in: Capsule())
+        .foregroundStyle(selected ? Color.white : color)
     }
 
     private var color: Color {
